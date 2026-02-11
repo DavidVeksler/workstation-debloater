@@ -915,13 +915,13 @@ static async Task AddDefenderExclusions(List<string> restore)
             continue;
 
         var (_, exitCode) = await RunProcess("powershell",
-            $"-NoProfile -Command \"Add-MpPreference -ExclusionPath '{path}'\"");
+            $"-NoProfile -Command \"Add-MpPreference -ExclusionPath '{normalized}'\"");
 
         if (exitCode == 0)
         {
             WriteColor($"    Exclusion added.", ConsoleColor.Green);
-            restore.Add($"# Remove Defender exclusion: {path}");
-            restore.Add($"Remove-MpPreference -ExclusionPath '{path}'");
+            restore.Add($"# Remove Defender exclusion: {normalized}");
+            restore.Add($"Remove-MpPreference -ExclusionPath '{normalized}'");
             restore.Add("");
         }
         else
