@@ -885,8 +885,8 @@ static async Task AddDefenderExclusions(List<string> restore)
         @"C:\Users\DVeksler\source\",
     ];
 
-    // Gather existing exclusions so we don't duplicate
-    HashSet<string> existing = [];
+    // Gather existing exclusions so we don't duplicate (case-insensitive for Windows paths)
+    HashSet<string> existing = new(StringComparer.OrdinalIgnoreCase);
     try
     {
         var (output, _) = await RunProcess("powershell", "-NoProfile -Command \"(Get-MpPreference).ExclusionPath -join '|'\"");
