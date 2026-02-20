@@ -31,6 +31,25 @@ WriteColor("║        Dell Precision 7680 Optimizer            ║", ConsoleCol
 WriteColor("╚══════════════════════════════════════════════════╝", ConsoleColor.Cyan);
 Console.WriteLine();
 
+// ── CLI dispatch ──────────────────────────────────────────────────────────────
+if (args.Length > 0)
+{
+    string cmd = args[0].TrimStart('-').ToLowerInvariant();
+    switch (cmd)
+    {
+        case "diag":     DiagFull();     return 0;
+        case "cpu":      DiagCpu(null);  return 0;
+        case "mem":      DiagMemory(null); return 0;
+        case "disk":     DiagDisk(null); return 0;
+        case "startup":  DiagStartup();  return 0;
+        case "services": DiagServices(); return 0;
+        case "help":     ShowDiagHelp(); return 0;
+        default:
+            WriteColor($"Unknown command '{args[0]}'. Run with --help for usage.", ConsoleColor.Yellow);
+            return 1;
+    }
+}
+
 while (true)
 {
     Console.WriteLine();
@@ -45,6 +64,7 @@ while (true)
     Console.WriteLine("[7] Kill resource-heavy non-essential processes");
     Console.WriteLine("[8] Disable unnecessary startup entries");
     Console.WriteLine("[9] Add Windows Defender exclusions for dev paths");
+    Console.WriteLine("[D] Run diagnostics (CPU, memory, disk, startup, services)");
     Console.WriteLine("[Q] Quit");
     Console.Write("\nSelect option: ");
 
@@ -63,6 +83,7 @@ while (true)
         case "7": KillResourceHeavyProcesses(restoreLines); break;
         case "8": DisableStartupEntries(restoreLines); break;
         case "9": await AddDefenderExclusions(restoreLines); break;
+        case "D": DiagFull(); break;
         case "Q": goto done;
         default:
             WriteColor("Invalid option.", ConsoleColor.Yellow);
@@ -293,6 +314,365 @@ static void ShowSystemSnapshot()
 
     foreach (var p in processes)
         try { p.Dispose(); } catch { }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [D] DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static void ShowDiagHelp()
+{
+    WriteColor("PerformanceFixer — diagnostics CLI", ConsoleColor.Cyan);
+    Console.WriteLine();
+    Console.WriteLine("Usage:");
+    Console.WriteLine("  PerformanceFixer <command>");
+    Console.WriteLine();
+    Console.WriteLine("Commands:");
+    Console.WriteLine("  diag        Full diagnostic report (all sub-diagnostics + bottleneck summary)");
+    Console.WriteLine("  cpu         CPU clock speed, throttle check, per-core %, top processes");
+    Console.WriteLine("  mem         RAM & page file usage, top processes by working set");
+    Console.WriteLine("  disk        Drive free space, busy %, queue length, read/write rates");
+    Console.WriteLine("  startup     Startup registry keys and startup folders");
+    Console.WriteLine("  services    All currently running Windows services");
+    Console.WriteLine("  --help      Show this help");
+    Console.WriteLine();
+    Console.WriteLine("Leading '--' is optional: both 'cpu' and '--cpu' work.");
+}
+
+static void DiagFull()
+{
+    SectionHeader("FULL DIAGNOSTIC REPORT");
+    var warnings = new List<string>();
+
+    DiagCpu(warnings);
+    Console.WriteLine();
+    DiagMemory(warnings);
+    Console.WriteLine();
+    DiagDisk(warnings);
+    Console.WriteLine();
+    DiagStartup();
+    Console.WriteLine();
+    DiagServices();
+
+    Console.WriteLine();
+    SectionHeader("BOTTLENECK SUMMARY");
+    if (warnings.Count == 0)
+    {
+        WriteColor("  No significant bottlenecks detected.", ConsoleColor.Green);
+    }
+    else
+    {
+        foreach (var w in warnings)
+            WriteColor($"  ! {w}", ConsoleColor.Red);
+    }
+}
+
+static void DiagCpu(List<string>? warnings)
+{
+    SectionHeader("CPU ANALYSIS");
+
+    // Clock speed & throttle check
+    try
+    {
+        using var query = new ManagementObjectSearcher("SELECT CurrentClockSpeed, MaxClockSpeed, NumberOfLogicalProcessors FROM Win32_Processor");
+        foreach (ManagementObject obj in query.Get())
+        {
+            uint current = (uint)obj["CurrentClockSpeed"];
+            uint max = (uint)obj["MaxClockSpeed"];
+            uint cores = (uint)obj["NumberOfLogicalProcessors"];
+            double ratio = (double)current / max * 100.0;
+            string throttleIndicator = ratio < 70.0 ? " [THROTTLED]" : "";
+            ConsoleColor clk = ratio < 70.0 ? ConsoleColor.Red : ConsoleColor.Green;
+            Console.Write($"  Clock: ");
+            WriteInline($"{current} MHz / {max} MHz ({ratio:F0}%){throttleIndicator}", clk);
+            Console.WriteLine($"  Logical cores: {cores}");
+            if (ratio < 70.0)
+                warnings?.Add($"CPU throttling: running at {ratio:F0}% of max clock — check power plan / thermals");
+        }
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  (WMI clock query failed: {ex.Message})", ConsoleColor.Yellow);
+    }
+
+    // Per-core % bar via WMI
+    Console.WriteLine("\n  Per-core usage (WMI):");
+    try
+    {
+        double totalPct = 0;
+        int coreCount = 0;
+        using var query = new ManagementObjectSearcher(
+            "SELECT Name, PercentProcessorTime FROM Win32_PerfFormattedData_PerfOS_Processor");
+        var rows = new List<(string Name, ulong Pct)>();
+        foreach (ManagementObject obj in query.Get())
+        {
+            string name = (string)obj["Name"];
+            ulong pct = (ulong)obj["PercentProcessorTime"];
+            rows.Add((name, pct));
+        }
+        // _Total first, then individual cores
+        foreach (var (name, pct) in rows.OrderBy(r => r.Name == "_Total" ? "" : r.Name))
+        {
+            if (name == "_Total")
+            {
+                totalPct = pct;
+                continue;
+            }
+            coreCount++;
+            string bar = new string('█', (int)(pct / 5)) + new string('░', 20 - (int)(pct / 5));
+            ConsoleColor col = pct > 80 ? ConsoleColor.Red : pct > 50 ? ConsoleColor.Yellow : ConsoleColor.Green;
+            Console.Write($"    Core {name,3}: ");
+            WriteInline($"[{bar}] {pct,3}%", col);
+            Console.WriteLine();
+        }
+        Console.Write($"    Total  : ");
+        ConsoleColor totalCol = totalPct > 80 ? ConsoleColor.Red : totalPct > 50 ? ConsoleColor.Yellow : ConsoleColor.Green;
+        WriteInline($"{totalPct:F0}%", totalCol);
+        Console.WriteLine();
+        if (totalPct > 80)
+            warnings?.Add($"CPU bottleneck: total CPU usage {totalPct:F0}% > 80%");
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  (WMI per-core query failed: {ex.Message})", ConsoleColor.Yellow);
+    }
+
+    // 1-sec process CPU sample, top 15
+    Console.Write("\n  Sampling process CPU (1 second)...");
+    var processes = Process.GetProcesses();
+    var cpuStart = new Dictionary<int, TimeSpan>();
+    foreach (var p in processes)
+        try { cpuStart[p.Id] = p.TotalProcessorTime; } catch { }
+    Thread.Sleep(1000);
+    int cores2 = Environment.ProcessorCount;
+    var cpuUsages = new List<(string Name, int PID, double CpuPct, long Mem)>();
+    foreach (var p in processes)
+    {
+        try
+        {
+            if (cpuStart.TryGetValue(p.Id, out var start))
+            {
+                var elapsed = p.TotalProcessorTime - start;
+                double pct = elapsed.TotalMilliseconds / 1000.0 / cores2 * 100.0;
+                cpuUsages.Add((p.ProcessName, p.Id, pct, p.WorkingSet64));
+            }
+        }
+        catch { }
+        finally { try { p.Dispose(); } catch { } }
+    }
+    Console.WriteLine(" done.");
+
+    var top = cpuUsages.OrderByDescending(x => x.CpuPct).Take(15).ToList();
+    Console.WriteLine($"\n  {"Process",-32} {"PID",8} {"CPU %",8} {"RAM",12}");
+    foreach (var (name, pid, cpu, mem) in top)
+    {
+        ConsoleColor col = cpu > 20 ? ConsoleColor.Red : cpu > 5 ? ConsoleColor.Yellow : ConsoleColor.White;
+        WriteInline($"  {name,-32} {pid,8} {cpu,7:F1}% {FormatBytes(mem),12}", col);
+        Console.WriteLine();
+    }
+}
+
+static void DiagMemory(List<string>? warnings)
+{
+    SectionHeader("MEMORY ANALYSIS");
+
+    try
+    {
+        using var query = new ManagementObjectSearcher(
+            "SELECT TotalVisibleMemorySize, FreePhysicalMemory, TotalPageFileSize, FreeSpaceInPagingFiles FROM Win32_OperatingSystem");
+        foreach (ManagementObject obj in query.Get())
+        {
+            ulong totalKb = (ulong)obj["TotalVisibleMemorySize"];
+            ulong freeKb  = (ulong)obj["FreePhysicalMemory"];
+            ulong usedKb  = totalKb - freeKb;
+            ulong pfTotalKb = (ulong)obj["TotalPageFileSize"];
+            ulong pfFreeKb  = (ulong)obj["FreeSpaceInPagingFiles"];
+            ulong pfUsedKb  = pfTotalKb - pfFreeKb;
+
+            double ramPct = (double)usedKb / totalKb * 100.0;
+            double pfPct  = pfTotalKb > 0 ? (double)pfUsedKb / pfTotalKb * 100.0 : 0;
+
+            ConsoleColor ramCol = ramPct > 90 ? ConsoleColor.Red : ramPct > 75 ? ConsoleColor.Yellow : ConsoleColor.Green;
+            ConsoleColor pfCol  = pfPct  > 50 ? ConsoleColor.Red : ConsoleColor.Green;
+
+            Console.Write($"  RAM:       ");
+            WriteInline($"{FormatBytes((long)usedKb * 1024)} / {FormatBytes((long)totalKb * 1024)} ({ramPct:F0}% used)", ramCol);
+            Console.WriteLine();
+            Console.Write($"  Page file: ");
+            WriteInline($"{FormatBytes((long)pfUsedKb * 1024)} / {FormatBytes((long)pfTotalKb * 1024)} ({pfPct:F0}% used)", pfCol);
+            Console.WriteLine();
+
+            if (ramPct > 90)
+                warnings?.Add($"RAM severe pressure: {ramPct:F0}% used");
+            else if (ramPct > 75)
+                warnings?.Add($"RAM high usage: {ramPct:F0}% used");
+            if (pfPct > 50)
+                warnings?.Add($"Page file {pfPct:F0}% used — system is swapping (RAM bottleneck)");
+        }
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  (WMI memory query failed: {ex.Message})", ConsoleColor.Yellow);
+    }
+
+    // Top 15 by working set
+    Console.WriteLine("\n  Top 15 processes by RAM:");
+    Console.WriteLine($"  {"Process",-32} {"PID",8} {"RAM",12}");
+    var memProcs = new List<(string Name, int PID, long Mem)>();
+    foreach (var p in Process.GetProcesses())
+    {
+        try { memProcs.Add((p.ProcessName, p.Id, p.WorkingSet64)); }
+        catch { memProcs.Add((p.ProcessName, p.Id, 0L)); }
+        finally { try { p.Dispose(); } catch { } }
+    }
+    foreach (var (mName, mPid, mMem) in memProcs.OrderByDescending(x => x.Mem).Take(15))
+    {
+        ConsoleColor col = mMem > 1L * 1024 * 1024 * 1024 ? ConsoleColor.Red
+                         : mMem > 512L * 1024 * 1024      ? ConsoleColor.Yellow
+                         : ConsoleColor.White;
+        WriteInline($"  {mName,-32} {mPid,8} {FormatBytes(mMem),12}", col);
+        Console.WriteLine();
+    }
+}
+
+static void DiagDisk(List<string>? warnings)
+{
+    SectionHeader("DISK ANALYSIS");
+
+    // Free space per drive
+    Console.WriteLine("  Drive free space:");
+    foreach (var drive in DriveInfo.GetDrives())
+    {
+        try
+        {
+            if (!drive.IsReady) continue;
+            double freePct = (double)drive.AvailableFreeSpace / drive.TotalSize * 100.0;
+            ConsoleColor col = freePct < 10 ? ConsoleColor.Red : freePct < 20 ? ConsoleColor.Yellow : ConsoleColor.Green;
+            Console.Write($"    {drive.Name,-6} {FormatBytes(drive.AvailableFreeSpace),10} free / {FormatBytes(drive.TotalSize),10} total  ");
+            WriteInline($"({freePct:F0}% free)", col);
+            Console.WriteLine();
+            if (freePct < 10)
+                warnings?.Add($"Drive {drive.Name} nearly full: only {freePct:F0}% free");
+        }
+        catch { }
+    }
+
+    // WMI disk performance counters
+    Console.WriteLine("\n  Disk I/O (WMI PerfFormattedData):");
+    Console.WriteLine($"  {"Volume",-10} {"Busy%",6} {"Queue",6} {"Read/s",12} {"Write/s",12}");
+    try
+    {
+        using var query = new ManagementObjectSearcher(
+            "SELECT Name, PercentDiskTime, CurrentDiskQueueLength, DiskReadBytesPersec, DiskWriteBytesPersec " +
+            "FROM Win32_PerfFormattedData_PerfDisk_LogicalDisk");
+        foreach (ManagementObject obj in query.Get())
+        {
+            string name   = (string)obj["Name"];
+            ulong  busy   = (ulong)obj["PercentDiskTime"];
+            ulong  queue  = (ulong)obj["CurrentDiskQueueLength"];
+            ulong  readBps  = (ulong)obj["DiskReadBytesPersec"];
+            ulong  writeBps = (ulong)obj["DiskWriteBytesPersec"];
+
+            ConsoleColor busyCol  = busy  > 80 ? ConsoleColor.Red : busy  > 50 ? ConsoleColor.Yellow : ConsoleColor.Green;
+            ConsoleColor queueCol = queue > 2  ? ConsoleColor.Red : ConsoleColor.Green;
+
+            Console.Write($"  {name,-10} ");
+            WriteInline($"{busy,5}%", busyCol);
+            Console.Write(" ");
+            WriteInline($"{queue,5}", queueCol);
+            Console.Write($" {FormatBytes((long)readBps),11}/s {FormatBytes((long)writeBps),11}/s");
+            Console.WriteLine();
+
+            if (queue > 2)
+                warnings?.Add($"Disk I/O bottleneck on {name}: queue length {queue}");
+            if (busy > 80)
+                warnings?.Add($"High disk load on {name}: {busy}% busy");
+        }
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  (WMI disk perf query failed: {ex.Message})", ConsoleColor.Yellow);
+    }
+}
+
+static void DiagStartup()
+{
+    SectionHeader("STARTUP ITEMS");
+
+    PrintStartupRegistryKey(Registry.CurrentUser,
+        @"Software\Microsoft\Windows\CurrentVersion\Run", "HKCU Run");
+    PrintStartupRegistryKey(Registry.LocalMachine,
+        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "HKLM Run");
+    PrintStartupRegistryKey(Registry.LocalMachine,
+        @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run", "HKLM WOW64 Run");
+
+    PrintStartupFolder(
+        Environment.GetFolderPath(Environment.SpecialFolder.Startup),
+        "User Startup folder");
+    PrintStartupFolder(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup),
+        "Common Startup folder");
+}
+
+static void PrintStartupRegistryKey(RegistryKey hive, string path, string label)
+{
+    Console.WriteLine($"\n  [{label}]");
+    try
+    {
+        using var key = hive.OpenSubKey(path);
+        if (key == null) { WriteColor("    (key not found)", ConsoleColor.DarkGray); return; }
+        var names = key.GetValueNames();
+        if (names.Length == 0) { WriteColor("    (empty)", ConsoleColor.DarkGray); return; }
+        foreach (var n in names)
+            Console.WriteLine($"    {n,-40} = {key.GetValue(n)}");
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"    (error: {ex.Message})", ConsoleColor.Yellow);
+    }
+}
+
+static void PrintStartupFolder(string folder, string label)
+{
+    Console.WriteLine($"\n  [{label}]  {folder}");
+    try
+    {
+        if (!Directory.Exists(folder)) { WriteColor("    (folder not found)", ConsoleColor.DarkGray); return; }
+        var files = Directory.GetFiles(folder);
+        if (files.Length == 0) { WriteColor("    (empty)", ConsoleColor.DarkGray); return; }
+        foreach (var f in files)
+            Console.WriteLine($"    {Path.GetFileName(f)}");
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"    (error: {ex.Message})", ConsoleColor.Yellow);
+    }
+}
+
+static void DiagServices()
+{
+    SectionHeader("RUNNING SERVICES");
+
+    try
+    {
+        var running = ServiceController.GetServices()
+            .Where(s => s.Status == ServiceControllerStatus.Running)
+            .OrderBy(s => s.ServiceName)
+            .ToList();
+
+        Console.WriteLine($"  {running.Count} service(s) currently running:\n");
+        Console.WriteLine($"  {"Service Name",-48} {"Display Name"}");
+        foreach (var svc in running)
+        {
+            try { Console.WriteLine($"  {svc.ServiceName,-48} {svc.DisplayName}"); }
+            catch { }
+            finally { svc.Dispose(); }
+        }
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  (Error enumerating services: {ex.Message})", ConsoleColor.Yellow);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
