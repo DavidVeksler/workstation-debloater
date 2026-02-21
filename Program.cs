@@ -37,13 +37,17 @@ if (args.Length > 0)
     string cmd = args[0].TrimStart('-').ToLowerInvariant();
     switch (cmd)
     {
-        case "diag":     DiagFull();     return 0;
-        case "cpu":      DiagCpu(null);  return 0;
-        case "mem":      DiagMemory(null); return 0;
-        case "disk":     DiagDisk(null); return 0;
-        case "startup":  DiagStartup();  return 0;
-        case "services": DiagServices(); return 0;
-        case "help":     ShowDiagHelp(); return 0;
+        case "diag":      DiagFull();          return 0;
+        case "cpu":       DiagCpu(null);       return 0;
+        case "mem":       DiagMemory(null);    return 0;
+        case "disk":      DiagDisk(null);      return 0;
+        case "startup":   DiagStartup();       return 0;
+        case "services":  DiagServices();      return 0;
+        case "diskspace": DiagDiskSpace(null); return 0;
+        case "gpu":       DiagGpu();           return 0;
+        case "net":       DiagNetwork(null);   return 0;
+        case "events":    DiagEvents(null);    return 0;
+        case "help":      ShowDiagHelp();      return 0;
         default:
             WriteColor($"Unknown command '{args[0]}'. Run with --help for usage.", ConsoleColor.Yellow);
             return 1;
@@ -334,6 +338,10 @@ static void ShowDiagHelp()
     Console.WriteLine("  disk        Drive free space, busy %, queue length, read/write rates");
     Console.WriteLine("  startup     Startup registry keys and startup folders");
     Console.WriteLine("  services    All currently running Windows services");
+    Console.WriteLine("  diskspace   Top space consumers on full drives, temp/junk sizes");
+    Console.WriteLine("  gpu         GPU name, VRAM, driver version, resolution");
+    Console.WriteLine("  net         Network adapters, IPs, TCP connection counts, DNS smoke test");
+    Console.WriteLine("  events      Recent Error/Critical events from System + Application logs");
     Console.WriteLine("  --help      Show this help");
     Console.WriteLine();
     Console.WriteLine("Leading '--' is optional: both 'cpu' and '--cpu' work.");
@@ -353,6 +361,14 @@ static void DiagFull()
     DiagStartup();
     Console.WriteLine();
     DiagServices();
+    Console.WriteLine();
+    DiagDiskSpace(warnings);
+    Console.WriteLine();
+    DiagGpu();
+    Console.WriteLine();
+    DiagNetwork(warnings);
+    Console.WriteLine();
+    DiagEvents(warnings);
 
     Console.WriteLine();
     SectionHeader("BOTTLENECK SUMMARY");
@@ -479,13 +495,13 @@ static void DiagMemory(List<string>? warnings)
     try
     {
         using var query = new ManagementObjectSearcher(
-            "SELECT TotalVisibleMemorySize, FreePhysicalMemory, TotalPageFileSize, FreeSpaceInPagingFiles FROM Win32_OperatingSystem");
+            "SELECT TotalVisibleMemorySize, FreePhysicalMemory, SizeStoredInPagingFiles, FreeSpaceInPagingFiles FROM Win32_OperatingSystem");
         foreach (ManagementObject obj in query.Get())
         {
             ulong totalKb = (ulong)obj["TotalVisibleMemorySize"];
             ulong freeKb  = (ulong)obj["FreePhysicalMemory"];
             ulong usedKb  = totalKb - freeKb;
-            ulong pfTotalKb = (ulong)obj["TotalPageFileSize"];
+            ulong pfTotalKb = (ulong)obj["SizeStoredInPagingFiles"];
             ulong pfFreeKb  = (ulong)obj["FreeSpaceInPagingFiles"];
             ulong pfUsedKb  = pfTotalKb - pfFreeKb;
 
@@ -567,11 +583,11 @@ static void DiagDisk(List<string>? warnings)
             "FROM Win32_PerfFormattedData_PerfDisk_LogicalDisk");
         foreach (ManagementObject obj in query.Get())
         {
-            string name   = (string)obj["Name"];
-            ulong  busy   = (ulong)obj["PercentDiskTime"];
-            ulong  queue  = (ulong)obj["CurrentDiskQueueLength"];
-            ulong  readBps  = (ulong)obj["DiskReadBytesPersec"];
-            ulong  writeBps = (ulong)obj["DiskWriteBytesPersec"];
+            string name     = (string)obj["Name"];
+            ulong  busy     = Convert.ToUInt64(obj["PercentDiskTime"]);
+            ulong  queue    = Convert.ToUInt64(obj["CurrentDiskQueueLength"]);
+            ulong  readBps  = Convert.ToUInt64(obj["DiskReadBytesPersec"]);
+            ulong  writeBps = Convert.ToUInt64(obj["DiskWriteBytesPersec"]);
 
             ConsoleColor busyCol  = busy  > 80 ? ConsoleColor.Red : busy  > 50 ? ConsoleColor.Yellow : ConsoleColor.Green;
             ConsoleColor queueCol = queue > 2  ? ConsoleColor.Red : ConsoleColor.Green;
@@ -673,6 +689,292 @@ static void DiagServices()
     {
         WriteColor($"  (Error enumerating services: {ex.Message})", ConsoleColor.Yellow);
     }
+}
+
+// Returns size of a directory tree, stopping early if the stopwatch exceeds budgetMs.
+// Returns the bytes counted so far (partial on timeout); sets timedOut=true when cut short.
+static long GetDirSizeBounded(string path, Stopwatch sw, long budgetMs, out bool timedOut)
+{
+    timedOut = false;
+    long size = 0;
+    try
+    {
+        foreach (var file in Directory.EnumerateFiles(path))
+        {
+            if (sw.ElapsedMilliseconds > budgetMs) { timedOut = true; return size; }
+            try { size += new FileInfo(file).Length; } catch { }
+        }
+        foreach (var sub in Directory.EnumerateDirectories(path))
+        {
+            if (sw.ElapsedMilliseconds > budgetMs) { timedOut = true; return size; }
+            size += GetDirSizeBounded(sub, sw, budgetMs, out bool subTimeout);
+            if (subTimeout) { timedOut = true; return size; }
+        }
+    }
+    catch { }
+    return size;
+}
+
+static void DiagDiskSpace(List<string>? warnings)
+{
+    SectionHeader("DISK SPACE BREAKDOWN");
+
+    var criticalDrives = new List<DriveInfo>();
+    foreach (var drive in DriveInfo.GetDrives())
+    {
+        try
+        {
+            if (!drive.IsReady) continue;
+            double freePct = (double)drive.AvailableFreeSpace / drive.TotalSize * 100.0;
+            if (freePct < 30.0)
+                criticalDrives.Add(drive);
+        }
+        catch { }
+    }
+
+    if (criticalDrives.Count == 0)
+    {
+        WriteColor("  All drives have >= 30% free space. No breakdown needed.", ConsoleColor.Green);
+        return;
+    }
+
+    foreach (var drive in criticalDrives)
+    {
+        double freePct = (double)drive.AvailableFreeSpace / drive.TotalSize * 100.0;
+        Console.WriteLine($"\n  Drive {drive.Name} — {FormatBytes(drive.AvailableFreeSpace)} free / {FormatBytes(drive.TotalSize)} total ({freePct:F0}% free)");
+
+        if (freePct < 10)
+            warnings?.Add($"Drive {drive.Name} critically low: {freePct:F0}% free — see diskspace report for top consumers");
+
+        // Top 15 subdirectories by size — 15 s total budget shared across all dirs on this drive
+        const long driveBudgetMs = 15_000;
+        Console.WriteLine($"  Top 15 subdirectories ({driveBudgetMs / 1000} s total scan budget, + = partial):");
+        var dirSizes = new List<(string Path, long Size, bool Partial)>();
+        var driveSw = Stopwatch.StartNew();
+        try
+        {
+            foreach (var dir in Directory.EnumerateDirectories(drive.RootDirectory.FullName))
+            {
+                if (driveSw.ElapsedMilliseconds >= driveBudgetMs)
+                {
+                    dirSizes.Add((dir + " [scan budget exhausted]", 0, true));
+                    break;
+                }
+                long size = GetDirSizeBounded(dir, driveSw, driveBudgetMs, out bool partial);
+                dirSizes.Add((dir, size, partial));
+            }
+        }
+        catch { }
+
+        foreach (var (path, size, partial) in dirSizes.OrderByDescending(x => x.Size).Take(15))
+        {
+            ConsoleColor col = size > 10L * 1024 * 1024 * 1024 ? ConsoleColor.Red
+                             : size > 2L  * 1024 * 1024 * 1024 ? ConsoleColor.Yellow
+                             : ConsoleColor.White;
+            string flag = partial ? "+" : " ";
+            WriteInline($"    {FormatBytes(size),12}{flag} {path}", col);
+            Console.WriteLine();
+        }
+
+        // Known junk locations — 10 s total budget
+        Console.WriteLine("\n  Known junk locations:");
+        var junkPaths = new List<(string Label, string Path)>
+        {
+            ("%TEMP%",                         Environment.GetEnvironmentVariable("TEMP") ?? ""),
+            (@"C:\Windows\Temp",              @"C:\Windows\Temp"),
+            (@"Windows Update cache",          @"C:\Windows\SoftwareDistribution\Download"),
+            ($@"$Recycle.Bin ({drive.Name})", Path.Combine(drive.RootDirectory.FullName, "$Recycle.Bin")),
+        };
+
+        foreach (var (label, junkPath) in junkPaths)
+        {
+            if (string.IsNullOrEmpty(junkPath) || !Directory.Exists(junkPath)) continue;
+            if (!junkPath.StartsWith(drive.Name, StringComparison.OrdinalIgnoreCase) &&
+                !junkPath.StartsWith(drive.RootDirectory.FullName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var sw = Stopwatch.StartNew();
+            long size = GetDirSizeBounded(junkPath, sw, 5_000, out bool partial);
+            string flag = partial ? "+" : " ";
+            ConsoleColor col = size > 1L * 1024 * 1024 * 1024 ? ConsoleColor.Red
+                             : size > 100L * 1024 * 1024      ? ConsoleColor.Yellow
+                             : ConsoleColor.DarkGray;
+            WriteInline($"    {FormatBytes(size),12}{flag} {label} ({junkPath})", col);
+            Console.WriteLine();
+        }
+    }
+}
+
+static void DiagGpu()
+{
+    SectionHeader("GPU ANALYSIS");
+
+    try
+    {
+        using var query = new ManagementObjectSearcher(
+            "SELECT Name, DriverVersion, DriverDate, AdapterRAM, " +
+            "CurrentHorizontalResolution, CurrentVerticalResolution, CurrentRefreshRate " +
+            "FROM Win32_VideoController");
+        bool found = false;
+        foreach (ManagementObject obj in query.Get())
+        {
+            found = true;
+            string name          = obj["Name"]?.ToString() ?? "(unknown)";
+            string driverVer     = obj["DriverVersion"]?.ToString() ?? "(unknown)";
+            string driverDateRaw = obj["DriverDate"]?.ToString() ?? "";
+            ulong  adapterRam    = Convert.ToUInt64(obj["AdapterRAM"] ?? 0UL);
+            uint   hRes          = Convert.ToUInt32(obj["CurrentHorizontalResolution"] ?? 0U);
+            uint   vRes          = Convert.ToUInt32(obj["CurrentVerticalResolution"] ?? 0U);
+            uint   refreshRate   = Convert.ToUInt32(obj["CurrentRefreshRate"] ?? 0U);
+
+            // DriverDate is a WMI datetime string like "20230415000000.000000+000"
+            string driverDate = driverDateRaw.Length >= 8
+                ? $"{driverDateRaw[0..4]}-{driverDateRaw[4..6]}-{driverDateRaw[6..8]}"
+                : driverDateRaw;
+
+            Console.WriteLine($"  GPU:         {name}");
+            Console.WriteLine($"  VRAM:        {FormatBytes((long)adapterRam)}");
+            Console.WriteLine($"  Driver:      {driverVer}  (dated {driverDate})");
+            Console.WriteLine($"  Resolution:  {hRes} x {vRes} @ {refreshRate} Hz");
+            Console.WriteLine();
+        }
+        if (!found)
+            WriteColor("  No video controllers found via WMI.", ConsoleColor.Yellow);
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  (WMI GPU query failed: {ex.Message})", ConsoleColor.Yellow);
+    }
+}
+
+static void DiagNetwork(List<string>? warnings)
+{
+    SectionHeader("NETWORK ANALYSIS");
+
+    // Adapters with IP enabled
+    Console.WriteLine("  Active network adapters:");
+    try
+    {
+        using var query = new ManagementObjectSearcher(
+            "SELECT Description, IPAddress, DefaultIPGateway, DNSServerSearchOrder " +
+            "FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = True");
+        foreach (ManagementObject obj in query.Get())
+        {
+            string desc    = obj["Description"]?.ToString() ?? "(unknown)";
+            var    ips     = (string[]?)obj["IPAddress"] ?? [];
+            var    gws     = (string[]?)obj["DefaultIPGateway"] ?? [];
+            var    dns     = (string[]?)obj["DNSServerSearchOrder"] ?? [];
+
+            Console.WriteLine($"\n    {desc}");
+            Console.WriteLine($"      IP:       {string.Join(", ", ips)}");
+            Console.WriteLine($"      Gateway:  {string.Join(", ", gws)}");
+            Console.WriteLine($"      DNS:      {string.Join(", ", dns)}");
+        }
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  (WMI network adapter query failed: {ex.Message})", ConsoleColor.Yellow);
+    }
+
+    // TCP connection state counts
+    Console.WriteLine("\n  TCP connection states:");
+    try
+    {
+        var connections = System.Net.NetworkInformation.IPGlobalProperties
+            .GetIPGlobalProperties()
+            .GetActiveTcpConnections();
+
+        var stateCounts = connections
+            .GroupBy(c => c.State)
+            .OrderByDescending(g => g.Count())
+            .ToList();
+
+        int established = 0;
+        foreach (var group in stateCounts)
+        {
+            if (group.Key == System.Net.NetworkInformation.TcpState.Established)
+                established = group.Count();
+            Console.WriteLine($"    {group.Key,-20} {group.Count(),6}");
+        }
+        Console.WriteLine($"    {"Total",-20} {connections.Length,6}");
+
+        if (established > 500)
+            warnings?.Add($"High TCP connection count: {established} established connections");
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  (TCP connection query failed: {ex.Message})", ConsoleColor.Yellow);
+    }
+
+    // DNS smoke test
+    Console.Write("\n  DNS resolution test (google.com)... ");
+    try
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var entry = System.Net.Dns.GetHostEntry("google.com");
+        sw.Stop();
+        ConsoleColor col = sw.ElapsedMilliseconds > 500 ? ConsoleColor.Yellow : ConsoleColor.Green;
+        WriteInline($"{sw.ElapsedMilliseconds} ms", col);
+        Console.WriteLine($" — resolved to {entry.AddressList.FirstOrDefault()}");
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"FAILED ({ex.Message})", ConsoleColor.Red);
+        warnings?.Add($"DNS resolution failure: {ex.Message}");
+    }
+}
+
+static void DiagEvents(List<string>? warnings)
+{
+    SectionHeader("RECENT WINDOWS ERROR EVENTS");
+
+    int errorCount24h = 0;
+    var cutoff = DateTime.Now.AddHours(-24);
+
+    foreach (var logName in new[] { "System", "Application" })
+    {
+        Console.WriteLine($"\n  [{logName} log — last 200 entries, errors only]");
+        try
+        {
+            using var log = new System.Diagnostics.EventLog(logName);
+            var entries = log.Entries.Cast<System.Diagnostics.EventLogEntry>()
+                .Reverse()
+                .Take(200)
+                .Where(e => e.EntryType == System.Diagnostics.EventLogEntryType.Error ||
+                            e.EntryType == System.Diagnostics.EventLogEntryType.FailureAudit)
+                .ToList();
+
+            if (entries.Count == 0)
+            {
+                WriteColor("    (no errors found)", ConsoleColor.DarkGray);
+                continue;
+            }
+
+            foreach (var entry in entries)
+            {
+                string msg = entry.Message.Length > 120
+                    ? entry.Message[..120] + "…"
+                    : entry.Message;
+                // Collapse newlines for compact display
+                msg = msg.Replace('\n', ' ').Replace('\r', ' ');
+
+                ConsoleColor col = entry.TimeWritten >= cutoff ? ConsoleColor.Red : ConsoleColor.DarkGray;
+                WriteInline($"    {entry.TimeWritten:MM-dd HH:mm}  [{entry.Source}] ID={entry.InstanceId}  {msg}", col);
+                Console.WriteLine();
+
+                if (entry.TimeWritten >= cutoff)
+                    errorCount24h++;
+            }
+        }
+        catch (Exception ex)
+        {
+            WriteColor($"  (EventLog read failed for {logName}: {ex.Message})", ConsoleColor.Yellow);
+        }
+    }
+
+    Console.WriteLine($"\n  Errors in past 24h: {errorCount24h}");
+    if (errorCount24h > 10)
+        warnings?.Add($"High system error rate: {errorCount24h} errors logged in the past 24 hours");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
