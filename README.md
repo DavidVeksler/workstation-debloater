@@ -1,6 +1,14 @@
 # workstation-debloater
 
-A menu-driven .NET 10 console utility that automates performance fixes for Windows dev workstations. Built for Dell Precision laptops but applicable to any bloated Windows developer machine.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![.NET 10](https://img.shields.io/badge/.NET-10.0-512BD4)](https://dotnet.microsoft.com/download/dotnet/10.0)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6)](https://github.com/DavidVeksler/workstation-debloater)
+
+A menu-driven **.NET 10 console utility** for **Windows performance tuning** — it debloats a
+Windows **developer workstation** by killing bloatware services and orphaned processes, tuning
+the power plan, trimming startup entries, and adding Windows Defender exclusions for common dev
+paths. Built for a Dell Precision laptop but applicable to any bloated Windows dev machine running
+Visual Studio, .NET, and the usual OEM/IT agent sprawl.
 
 ## What it does
 
@@ -39,6 +47,32 @@ Run it as Administrator, pick fixes from the menu (or run them all), and confirm
 | 7 | **Heavy Processes** | Kills PhoneExperienceHost, LM Studio, SDXHelper, WhatsApp |
 | 8 | **Startup Entries** | Removes LM Studio, GoogleChromeAutoLaunch_*, Logi Tune from registry Run keys |
 | 9 | **Defender Exclusions** | Adds path exclusions for dotnet, Visual Studio, .nuget, and source directories |
+
+## Diagnostics CLI
+
+Beyond the interactive menu, the same executable exposes a non-interactive diagnostics CLI —
+useful for quick health checks without stepping through the menu:
+
+```powershell
+PerformanceFixer <command>
+```
+
+| Command | What it reports |
+|---|---|
+| `diag` | Full diagnostic report — all sub-diagnostics plus a bottleneck summary |
+| `cpu` | CPU clock speed, throttle check, per-core %, top processes |
+| `mem` | RAM & page file usage, top processes by working set |
+| `disk` | Drive free space, busy %, queue length, read/write rates |
+| `startup` | Startup registry keys and startup folders |
+| `services` | All currently running Windows services |
+| `diskspace` | Top space consumers on full drives, temp/junk sizes |
+| `gpu` | GPU name, VRAM, driver version, resolution |
+| `net` | Network adapters, IPs, TCP connection counts, DNS smoke test |
+| `events` | Recent Error/Critical events from System + Application logs |
+| `help` / `--help` | Show CLI usage |
+
+The leading `--` is optional — `cpu` and `--cpu` both work. Run with no arguments to launch the
+interactive menu instead (menu option `[D]` runs the same full diagnostics).
 
 ## Safety
 
@@ -81,4 +115,4 @@ The restore script is generated each time you run the tool and includes only the
 
 ## License
 
-MIT
+[MIT](LICENSE)
