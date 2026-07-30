@@ -45,6 +45,10 @@ while (true)
     Console.WriteLine("[7] Kill resource-heavy non-essential processes");
     Console.WriteLine("[8] Disable unnecessary startup entries");
     Console.WriteLine("[9] Add Windows Defender exclusions for dev paths");
+    Console.WriteLine("[A] Clear temporary files (%TEMP%, C:\\Windows\\Temp)");
+    Console.WriteLine("[B] Set visual effects to Best Performance");
+    Console.WriteLine("[C] Disable SysMain & Windows Search (reduces background disk I/O on SSDs)");
+    Console.WriteLine("[D] Registry performance tweaks (NTFS last-access, WER, DNS flush)");
     Console.WriteLine("[Q] Quit");
     Console.Write("\nSelect option: ");
 
@@ -63,6 +67,10 @@ while (true)
         case "7": KillResourceHeavyProcesses(restoreLines); break;
         case "8": DisableStartupEntries(restoreLines); break;
         case "9": await AddDefenderExclusions(restoreLines); break;
+        case "A": ClearTempFiles(restoreLines); break;
+        case "B": SetVisualEffectsBestPerformance(restoreLines); break;
+        case "C": DisableWindowsPerfServices(restoreLines); break;
+        case "D": await ApplyRegistryPerfTweaks(restoreLines); break;
         case "Q": goto done;
         default:
             WriteColor("Invalid option.", ConsoleColor.Yellow);
@@ -196,6 +204,14 @@ static async Task RunAllFixes(List<string> restore)
     DisableStartupEntries(restore);
     Console.WriteLine();
     await AddDefenderExclusions(restore);
+    Console.WriteLine();
+    ClearTempFiles(restore);
+    Console.WriteLine();
+    SetVisualEffectsBestPerformance(restore);
+    Console.WriteLine();
+    DisableWindowsPerfServices(restore);
+    Console.WriteLine();
+    await ApplyRegistryPerfTweaks(restore);
     Console.WriteLine();
 
     WriteColor("All fix categories processed. Taking final snapshot...\n", ConsoleColor.Green);
@@ -929,4 +945,259 @@ static async Task AddDefenderExclusions(List<string> restore)
             WriteColor($"    Failed to add exclusion.", ConsoleColor.Red);
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [A] CLEAR TEMPORARY FILES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static void ClearTempFiles(List<string> restore)
+{
+    SectionHeader("CLEAR TEMPORARY FILES");
+
+    string[] tempDirs =
+    [
+        Path.GetTempPath(),
+        @"C:\Windows\Temp",
+    ];
+
+    foreach (var dir in tempDirs)
+    {
+        if (!Directory.Exists(dir)) continue;
+
+        var files = new List<(string path, long size)>();
+        long totalSize = 0;
+        try
+        {
+            foreach (var f in Directory.GetFiles(dir, "*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    long size = new FileInfo(f).Length;
+                    files.Add((f, size));
+                    totalSize += size;
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        Console.WriteLine($"  {dir}: {files.Count} files ({FormatBytes(totalSize)})");
+        if (files.Count == 0)
+        {
+            WriteColor("    Nothing to clean.", ConsoleColor.DarkGray);
+            continue;
+        }
+
+        if (!Confirm($"Delete temp files in '{dir}'?"))
+            continue;
+
+        int deleted = 0, skipped = 0;
+        long freed = 0;
+        foreach (var (path, size) in files)
+        {
+            try
+            {
+                File.Delete(path);
+                deleted++;
+                freed += size;
+            }
+            catch { skipped++; }
+        }
+
+        // Remove empty subdirectories
+        try
+        {
+            foreach (var d in Directory.GetDirectories(dir, "*", SearchOption.TopDirectoryOnly))
+                try { Directory.Delete(d, recursive: true); } catch { }
+        }
+        catch { }
+
+        WriteColor($"    Deleted {deleted} files ({FormatBytes(freed)}), {skipped} skipped (in use).", ConsoleColor.Green);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [B] VISUAL EFFECTS — BEST PERFORMANCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static void SetVisualEffectsBestPerformance(List<string> restore)
+{
+    SectionHeader("SET VISUAL EFFECTS TO BEST PERFORMANCE");
+
+    const string regPath = @"Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects";
+    const int bestPerformance = 2;
+
+    int current = -1;
+    try
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(regPath);
+        if (key != null)
+            current = Convert.ToInt32(key.GetValue("VisualFXSetting") ?? -1);
+    }
+    catch { }
+
+    string currentDesc = current switch
+    {
+        1 => "Best Appearance",
+        2 => "Best Performance",
+        3 => "Let Windows Decide",
+        _ => $"Custom / Unknown ({current})"
+    };
+    Console.WriteLine($"  Current: {currentDesc}");
+
+    if (current == bestPerformance)
+    {
+        WriteColor("  Already set to Best Performance — no change needed.", ConsoleColor.Green);
+        return;
+    }
+
+    if (!Confirm("Switch visual effects to Best Performance? (disables animations/shadows; log off and on to apply fully)"))
+        return;
+
+    try
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(regPath, writable: true);
+        key.SetValue("VisualFXSetting", bestPerformance, RegistryValueKind.DWord);
+        WriteColor("  Applied. Log off and back on for full effect.", ConsoleColor.Green);
+        int restoreValue = current == -1 ? 3 : current;
+        restore.Add("# Restore visual effects setting");
+        restore.Add($"Set-ItemProperty -Path 'HKCU:\\{regPath}' -Name 'VisualFXSetting' -Value {restoreValue}");
+        restore.Add("");
+    }
+    catch (Exception ex)
+    {
+        WriteColor($"  Failed: {ex.Message}", ConsoleColor.Red);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [C] DISABLE PERFORMANCE-HINDERING WINDOWS SERVICES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static void DisableWindowsPerfServices(List<string> restore)
+{
+    SectionHeader("DISABLE PERFORMANCE-HINDERING WINDOWS SERVICES");
+    WriteColor("  SysMain (Superfetch) prefetches files into RAM, causing high SSD I/O.", ConsoleColor.DarkGray);
+    WriteColor("  WSearch indexes files in the background, spiking I/O during builds.", ConsoleColor.DarkGray);
+
+    string[] services =
+    [
+        "SysMain",  // Superfetch / Prefetch
+        "WSearch",  // Windows Search indexer
+    ];
+
+    StopAndDisableServices(services, restore);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// [D] REGISTRY PERFORMANCE TWEAKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static async Task ApplyRegistryPerfTweaks(List<string> restore)
+{
+    SectionHeader("REGISTRY PERFORMANCE TWEAKS");
+
+    // ── 1. NTFS last-access timestamps ─────────────────────────────────────────
+    Console.WriteLine("  [1/3] NTFS Last-Access Timestamps");
+    Console.WriteLine("    Every file read updates a timestamp on disk by default. Disabling");
+    Console.WriteLine("    this eliminates a write I/O on every read — measurable during builds.");
+
+    const string ntfsPath = @"SYSTEM\CurrentControlSet\Control\FileSystem";
+    int currentNtfs = -1;
+    try
+    {
+        using var key = Registry.LocalMachine.OpenSubKey(ntfsPath);
+        currentNtfs = Convert.ToInt32(key?.GetValue("NtfsDisableLastAccessUpdate") ?? -1);
+    }
+    catch { }
+
+    string ntfsDesc = currentNtfs switch
+    {
+        0 => "enabled (timestamps updated on every read)",
+        1 => "disabled (user-managed)",
+        3 => "disabled (system-managed)",
+        _ => $"unknown/default ({currentNtfs})"
+    };
+    Console.WriteLine($"    Current: {ntfsDesc}");
+
+    if (currentNtfs == 1 || currentNtfs == 3)
+    {
+        WriteColor("    Already disabled.", ConsoleColor.DarkGray);
+    }
+    else if (Confirm("Disable NTFS last-access timestamp updates? (takes effect after reboot)"))
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(ntfsPath, writable: true);
+            if (key != null)
+            {
+                key.SetValue("NtfsDisableLastAccessUpdate", 1, RegistryValueKind.DWord);
+                WriteColor("    Applied. Reboot required.", ConsoleColor.Green);
+                int restoreVal = currentNtfs == -1 ? 0 : currentNtfs;
+                restore.Add("# Restore NTFS last-access timestamps");
+                restore.Add($"Set-ItemProperty -Path 'HKLM:\\{ntfsPath}' -Name 'NtfsDisableLastAccessUpdate' -Value {restoreVal}");
+                restore.Add("");
+            }
+            else
+            {
+                WriteColor("    Registry key not found.", ConsoleColor.Red);
+            }
+        }
+        catch (Exception ex) { WriteColor($"    Failed: {ex.Message}", ConsoleColor.Red); }
+    }
+
+    Console.WriteLine();
+
+    // ── 2. Windows Error Reporting ─────────────────────────────────────────────
+    Console.WriteLine("  [2/3] Windows Error Reporting (WER)");
+    Console.WriteLine("    WER writes crash dumps to disk when apps fail. Disabling stops the");
+    Console.WriteLine("    background I/O spikes it causes, especially during unstable build sessions.");
+
+    const string werPath = @"SOFTWARE\Microsoft\Windows\Windows Error Reporting";
+    int currentWer = -1;
+    try
+    {
+        using var key = Registry.LocalMachine.OpenSubKey(werPath);
+        currentWer = Convert.ToInt32(key?.GetValue("Disabled") ?? -1);
+    }
+    catch { }
+
+    Console.WriteLine($"    Current WER Disabled: {(currentWer == 1 ? "yes" : "no (enabled)")}");
+
+    if (currentWer == 1)
+    {
+        WriteColor("    Already disabled.", ConsoleColor.DarkGray);
+    }
+    else if (Confirm("Disable Windows Error Reporting?"))
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(werPath, writable: true)
+                            ?? Registry.LocalMachine.CreateSubKey(werPath);
+            key.SetValue("Disabled", 1, RegistryValueKind.DWord);
+            WriteColor("    Applied.", ConsoleColor.Green);
+            restore.Add("# Restore Windows Error Reporting");
+            restore.Add($"Set-ItemProperty -Path 'HKLM:\\{werPath}' -Name 'Disabled' -Value 0");
+            restore.Add("");
+        }
+        catch (Exception ex) { WriteColor($"    Failed: {ex.Message}", ConsoleColor.Red); }
+    }
+
+    Console.WriteLine();
+
+    // ── 3. Flush DNS cache ─────────────────────────────────────────────────────
+    Console.WriteLine("  [3/3] Flush DNS Resolver Cache");
+    Console.WriteLine("    Stale or negative DNS entries cause slow hostname lookups. Safe to flush anytime.");
+
+    if (Confirm("Flush DNS cache now?"))
+    {
+        var (output, exitCode) = await RunProcess("ipconfig", "/flushdns");
+        if (exitCode == 0)
+            WriteColor("    DNS cache flushed.", ConsoleColor.Green);
+        else
+            WriteColor($"    Failed: {output.Trim()}", ConsoleColor.Red);
+    }
+
+    WriteColor("\n  Note: Tweaks marked 'Reboot required' take effect after the next restart.", ConsoleColor.Yellow);
 }
